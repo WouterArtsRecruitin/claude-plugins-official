@@ -12,11 +12,18 @@
       "type": "http",
       "url": "https://api.githubcopilot.com/mcp/"
     },
-    "clay": {
+    "notion": {
       "command": "npx",
-      "args": ["-y", "@clayhq/clay-mcp@latest"],
+      "args": ["-y", "@notionhq/notion-mcp-server"],
       "env": {
-        "CLAY_API_KEY": "${CLAY_API_KEY}"
+        "OPENAPI_MCP_HEADERS": "{\"Authorization\": \"Bearer ${NOTION_API_KEY}\", \"Notion-Version\": \"2022-06-28\"}"
+      }
+    },
+    "figma": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/figma-mcp"],
+      "env": {
+        "FIGMA_ACCESS_TOKEN": "${FIGMA_ACCESS_TOKEN}"
       }
     },
     "slack": {
@@ -35,6 +42,13 @@
         "PIPEDRIVE_DOMAIN": "${PIPEDRIVE_DOMAIN}"
       }
     },
+    "clay": {
+      "command": "npx",
+      "args": ["-y", "@clayhq/clay-mcp@latest"],
+      "env": {
+        "CLAY_API_KEY": "${CLAY_API_KEY}"
+      }
+    },
     "linkedin": {
       "command": "npx",
       "args": ["-y", "@felipfr/linkedin-mcpserver"],
@@ -44,12 +58,31 @@
         "LINKEDIN_ACCESS_TOKEN": "${LINKEDIN_ACCESS_TOKEN}"
       }
     },
+    "stripe": {
+      "command": "npx",
+      "args": ["-y", "@stripe/mcp", "--tools=all"],
+      "env": {
+        "STRIPE_SECRET_KEY": "${STRIPE_SECRET_KEY}"
+      }
+    },
+    "posthog": {
+      "command": "npx",
+      "args": ["-y", "@nicholasblaskey/posthog-mcp"],
+      "env": {
+        "POSTHOG_API_KEY": "${POSTHOG_API_KEY}",
+        "POSTHOG_PROJECT_ID": "${POSTHOG_PROJECT_ID}"
+      }
+    },
     "ollama": {
       "command": "npx",
       "args": ["-y", "ollama-mcp"],
       "env": {
         "OLLAMA_HOST": "http://localhost:11434"
       }
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp@latest"]
     }
   }
 }
