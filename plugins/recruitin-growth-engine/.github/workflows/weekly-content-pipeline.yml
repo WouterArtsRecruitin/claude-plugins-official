@@ -1,0 +1,305 @@
+name: Weekly Content Pipeline
+
+on:
+  schedule:
+    - cron: '0 16 * * 5'  # Vrijdag 17:00 CET (16:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  content-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm install axios @supabase/supabase-js @notionhq/client @anthropic-ai/sdk
+
+      # ============================================================
+      # STAP 1: Top artikelen selecteren uit Supabase
+      # ============================================================
+      - name: "Step 1/4: Select top articles from this week"
+        id: select_articles
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          node -e "
+          const { createClient } = require('@supabase/supabase-js');
+          const fs = require('fs');
+
+          const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+          const week = Math.ceil((new Date() - new Date(new Date().getFullYear(), 0, 1)) / 604800000);
+          const year = new Date().getFullYear();
+
+          async function main() {
+            // Get this week's news + market trends
+            const { data: news } = await supabase.from('market_intelligence')
+              .select('*')
+              .in('data_type', ['sector_news', 'market_trend'])
+              .eq('week_number', week)
+              .eq('year', year)
+              .order('relevance_score', { ascending: false })
+              .limit(20);
+
+            // Get winning strategies for context
+            const { data: strategies } = await supabase.from('winning_strategies')
+              .select('*')
+              .limit(10);
+
+            // Get brand voice
+            const { data: voice } = await supabase.from('client_brand_voices')
+              .select('*')
+              .limit(1)
+              .single();
+
+            const context = {
+              articles: news || [],
+              strategies: strategies || [],
+              brand_voice: voice || {},
+              week: week,
+              year: year
+            };
+
+            fs.writeFileSync('content-context.json', JSON.stringify(context, null, 2));
+            console.log('Selected ' + (news?.length || 0) + ' articles for content generation');
+            console.log('Winning strategies: ' + (strategies?.length || 0));
+          }
+
+          main().catch(err => { console.error(err); process.exit(1); });
+          "
+
+      # ============================================================
+      # STAP 2: Generate content via Claude API
+      # ============================================================
+      - name: "Step 2/4: Generate LinkedIn + Blog content"
+        id: generate_content
+        if: steps.select_articles.outcome == 'success'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          node -e "
+          const Anthropic = require('@anthropic-ai/sdk');
+          const fs = require('fs');
+
+          const client = new Anthropic.default();
+          const context = JSON.parse(fs.readFileSync('content-context.json', 'utf8'));
+
+          const topArticles = context.articles.slice(0, 5).map(a => {
+            const raw = a.raw_data || {};
+            return '- ' + (a.metric_label || a.keyword) + ' (' + (raw.source || a.source || 'unknown') + ')';
+          }).join('\n');
+
+          const brandRules = context.brand_voice?.vocabulary_preferences
+            ? JSON.stringify(context.brand_voice.vocabulary_preferences)
+            : 'Semi-formal, data-driven, bold. Nederlands met Engelse vaktermen.';
+
+          async function generateWithRetry(prompt, retries = 3) {
+            for (let i = 0; i < retries; i++) {
+              try {
+                const msg = await client.messages.create({
+                  model: 'claude-sonnet-4-5-20250929',
+                  max_tokens: 4000,
+                  messages: [{ role: 'user', content: prompt }]
+                });
+                return msg.content[0].text;
+              } catch (err) {
+                if (i === retries - 1) throw err;
+                console.log('Retry ' + (i + 1) + ': ' + err.message);
+                await new Promise(r => setTimeout(r, Math.pow(2, i) * 2000));
+              }
+            }
+          }
+
+          async function main() {
+            const week = context.week;
+
+            // Determine 12-week cycle phase
+            const phase = week % 12;
+            let phaseDesc;
+            if (phase <= 3) phaseDesc = 'Foundation (data, trends, insights)';
+            else if (phase <= 6) phaseDesc = 'Authority (case studies, contrarian takes)';
+            else if (phase <= 9) phaseDesc = 'Engagement (polls, behind-the-scenes)';
+            else phaseDesc = 'Conversie (lead magnets, CTAs)';
+
+            const prompt = 'Je bent de content creator voor Recruitin, een recruitment marketing bureau in Nederland.\n\n' +
+              'Brand voice regels:\n' + brandRules + '\n\n' +
+              'We zitten in week ' + week + ' — fase: ' + phaseDesc + '\n\n' +
+              'Top nieuwsartikelen deze week:\n' + topArticles + '\n\n' +
+              'Genereer exact 3 outputs in het Nederlands:\n\n' +
+              '## OUTPUT 1: LinkedIn Post Wouter (Persoonlijk)\n' +
+              '- Max 1300 tekens\n' +
+              '- Contrarian of data_story stijl\n' +
+              '- Concrete cijfers uit de artikelen\n' +
+              '- Eindig met een vraag\n' +
+              '- 3-5 hashtags\n\n' +
+              '## OUTPUT 2: LinkedIn Post Recruitin (Bedrijfspagina)\n' +
+              '- Max 1300 tekens\n' +
+              '- Data-driven, professioneel\n' +
+              '- Focus op recruitment marketing insights\n' +
+              '- Duidelijke CTA passend bij fase ' + phaseDesc + '\n' +
+              '- 3-5 hashtags\n\n' +
+              '## OUTPUT 3: Blog Artikel\n' +
+              '- 800-1200 woorden\n' +
+              '- Titel + TL;DR + 3 secties + conclusie\n' +
+              '- Refereer aan concrete data uit de artikelen\n' +
+              '- Eindig met CTA\n\n' +
+              'BELANGRIJK: Gebruik NOOIT deze woorden: dynamisch team, marktconform salaris, passie voor, unieke kans, no-nonsense, platte organisatie.\n' +
+              'Gebruik WEL: cost-per-hire, talent pipeline, employer brand, candidate experience, data-gedreven.';
+
+            console.log('Generating content for week ' + week + ' (' + phaseDesc + ')...');
+            const content = await generateWithRetry(prompt);
+
+            const output = {
+              week: week,
+              year: context.year,
+              phase: phaseDesc,
+              generated_at: new Date().toISOString(),
+              content: content,
+              articles_used: context.articles.slice(0, 5).map(a => a.metric_label || a.keyword)
+            };
+
+            fs.writeFileSync('weekly-content.json', JSON.stringify(output, null, 2));
+            fs.writeFileSync('weekly-content.md', '# Week ' + week + ' Content — ' + phaseDesc + '\n\n' + content);
+            console.log('Content generated successfully (' + content.length + ' chars)');
+          }
+
+          main().catch(err => { console.error(err); process.exit(1); });
+          "
+
+      # ============================================================
+      # STAP 3: Push to Notion + Supabase
+      # ============================================================
+      - name: "Step 3/4: Push content to Notion & Supabase"
+        id: push_content
+        if: steps.generate_content.outcome == 'success'
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_CONTENT_DB_ID: 'b2c72864-8c56-4309-bedb-5714c534e6c2'
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          node -e "
+          const { Client } = require('@notionhq/client');
+          const { createClient } = require('@supabase/supabase-js');
+          const fs = require('fs');
+
+          const notion = new Client({ auth: process.env.NOTION_API_KEY });
+          const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+          async function main() {
+            const output = JSON.parse(fs.readFileSync('weekly-content.json', 'utf8'));
+
+            // Push to Notion Content Pipeline
+            try {
+              await notion.pages.create({
+                parent: { database_id: process.env.NOTION_CONTENT_DB_ID },
+                properties: {
+                  'Name': { title: [{ text: { content: 'Week ' + output.week + ' — ' + output.phase } }] },
+                  'Status': { select: { name: 'Draft' } }
+                },
+                children: [{
+                  object: 'block',
+                  type: 'paragraph',
+                  paragraph: { rich_text: [{ text: { content: output.content.slice(0, 2000) } }] }
+                }]
+              });
+              console.log('Pushed to Notion');
+            } catch (err) {
+              console.error('Notion push failed:', err.message);
+            }
+
+            // Log to Supabase content_log
+            const { data: campaign } = await supabase.from('campaigns')
+              .select('id')
+              .eq('campaign_type', 'authority')
+              .eq('status', 'active')
+              .limit(1)
+              .single();
+
+            if (campaign) {
+              const { error } = await supabase.from('content_log').insert([
+                {
+                  campaign_id: campaign.id,
+                  content_type: 'linkedin_post_personal',
+                  tone_of_voice: 'contrarian',
+                  content_body: 'Week ' + output.week + ' LinkedIn Wouter — Generated',
+                  phase: output.phase
+                },
+                {
+                  campaign_id: campaign.id,
+                  content_type: 'linkedin_post_company',
+                  tone_of_voice: 'data-driven',
+                  content_body: 'Week ' + output.week + ' LinkedIn Recruitin — Generated',
+                  phase: output.phase
+                },
+                {
+                  campaign_id: campaign.id,
+                  content_type: 'blog_article',
+                  tone_of_voice: 'semi-formal',
+                  content_body: 'Week ' + output.week + ' Blog — Generated',
+                  phase: output.phase
+                }
+              ]);
+              if (error) console.error('Supabase log error:', error.message);
+              else console.log('Logged 3 content items to Supabase');
+            }
+          }
+
+          main().catch(err => { console.error(err); process.exit(1); });
+          "
+
+      # ============================================================
+      # STAP 4: GitHub Issue + Slack Notification
+      # ============================================================
+      - name: "Step 4/4: Create GitHub Issue & Notify"
+        if: steps.generate_content.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # Create GitHub Issue with content
+          CONTENT=$(cat weekly-content.md | head -100)
+          gh issue create \
+            --title "📝 Weekly Content — Week $(date +%V) $(date +%Y-%m-%d)" \
+            --body "${CONTENT}" \
+            --label "content" || echo "Issue creation failed"
+
+          # Slack notification
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "📝 Weekly Content Generator voltooid — Week '"$(date +%V)"'. Check GitHub Issues voor de content."}' || true
+
+      - name: Upload content artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-content-${{ github.run_number }}
+          path: |
+            weekly-content.*
+            content-context.json
+          retention-days: 30
+
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"text": "❌ Weekly Content Pipeline GEFAALD — Check GitHub Actions"}' || true

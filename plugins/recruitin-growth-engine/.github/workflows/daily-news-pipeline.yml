@@ -1,0 +1,213 @@
+name: Daily News Pipeline
+
+on:
+  schedule:
+    - cron: '0 6 * * 1-5'  # Weekdagen 07:00 CET (06:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  daily-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: npm install axios @supabase/supabase-js @notionhq/client
+
+      - name: Scrape recruitment news
+        id: scrape
+        env:
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        run: |
+          node -e "
+          const axios = require('axios');
+          const fs = require('fs');
+
+          const QUERIES = [
+            'recruitment marketing Nederland',
+            'employer branding trends',
+            'arbeidsmarkt techniek Nederland',
+            'recruitment automation AI',
+            'talent acquisition trends 2026'
+          ];
+
+          async function fetchWithRetry(url, options, retries = 3) {
+            for (let i = 0; i < retries; i++) {
+              try {
+                const res = await axios.get(url, options);
+                return res.data;
+              } catch (err) {
+                if (i === retries - 1) throw err;
+                await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
+                console.log('Retry ' + (i + 1) + ' for: ' + url);
+              }
+            }
+          }
+
+          async function main() {
+            const allArticles = [];
+            const today = new Date().toISOString().split('T')[0];
+
+            for (const query of QUERIES) {
+              try {
+                const data = await fetchWithRetry(
+                  'https://api.search.brave.com/res/v1/news/search',
+                  {
+                    params: { q: query, count: 5, freshness: 'pd' },
+                    headers: { 'X-Subscription-Token': process.env.BRAVE_API_KEY }
+                  }
+                );
+
+                if (data.results) {
+                  for (const r of data.results) {
+                    allArticles.push({
+                      title: r.title,
+                      url: r.url,
+                      description: r.description || '',
+                      source: r.meta_url?.hostname || 'unknown',
+                      published: r.age || today,
+                      query: query,
+                      scraped_at: new Date().toISOString()
+                    });
+                  }
+                }
+                console.log(query + ': ' + (data.results?.length || 0) + ' articles');
+              } catch (err) {
+                console.error('Failed: ' + query + ' - ' + err.message);
+              }
+            }
+
+            // Dedup by URL
+            const unique = [...new Map(allArticles.map(a => [a.url, a])).values()];
+            fs.writeFileSync('daily-news.json', JSON.stringify(unique, null, 2));
+            console.log('Total unique articles: ' + unique.length);
+            console.log('::set-output name=count::' + unique.length);
+          }
+
+          main().catch(err => { console.error(err); process.exit(1); });
+          "
+
+      - name: Push to Supabase
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          node -e "
+          const { createClient } = require('@supabase/supabase-js');
+          const fs = require('fs');
+
+          const supabase = createClient(
+            process.env.SUPABASE_URL,
+            process.env.SUPABASE_SERVICE_ROLE_KEY
+          );
+
+          async function main() {
+            if (!fs.existsSync('daily-news.json')) {
+              console.log('No news file found, skipping');
+              return;
+            }
+
+            const articles = JSON.parse(fs.readFileSync('daily-news.json', 'utf8'));
+            const week = Math.ceil((new Date() - new Date(new Date().getFullYear(), 0, 1)) / 604800000);
+            const year = new Date().getFullYear();
+
+            const rows = articles.map(a => ({
+              data_type: 'sector_news',
+              keyword: a.query,
+              source: a.source,
+              metric_label: a.title,
+              raw_data: { url: a.url, description: a.description, published: a.published },
+              week_number: week,
+              year: year
+            }));
+
+            const { error } = await supabase
+              .from('market_intelligence')
+              .upsert(rows, { onConflict: 'id' });
+
+            if (error) console.error('Supabase error:', error.message);
+            else console.log('Pushed ' + rows.length + ' articles to Supabase');
+          }
+
+          main().catch(err => { console.error(err); process.exit(1); });
+          "
+
+      - name: Push to Notion
+        if: success()
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_NEWS_DB_ID: '2e82252c-bb15-81fd-aced-dfa7c14ea36c'
+        run: |
+          node -e "
+          const { Client } = require('@notionhq/client');
+          const fs = require('fs');
+
+          const notion = new Client({ auth: process.env.NOTION_API_KEY });
+
+          async function pushWithRetry(page, retries = 3) {
+            for (let i = 0; i < retries; i++) {
+              try {
+                await notion.pages.create(page);
+                return true;
+              } catch (err) {
+                if (i === retries - 1) { console.error('Failed:', err.message); return false; }
+                await new Promise(r => setTimeout(r, Math.pow(2, i) * 1000));
+              }
+            }
+          }
+
+          async function main() {
+            if (!fs.existsSync('daily-news.json')) return;
+            const articles = JSON.parse(fs.readFileSync('daily-news.json', 'utf8'));
+            let pushed = 0;
+
+            for (const a of articles.slice(0, 10)) {
+              const ok = await pushWithRetry({
+                parent: { database_id: process.env.NOTION_NEWS_DB_ID },
+                properties: {
+                  'Name': { title: [{ text: { content: a.title.slice(0, 100) } }] },
+                  'URL': { url: a.url },
+                  'Source': { rich_text: [{ text: { content: a.source } }] },
+                  'Query': { rich_text: [{ text: { content: a.query } }] }
+                }
+              });
+              if (ok) pushed++;
+            }
+            console.log('Pushed ' + pushed + ' articles to Notion');
+          }
+
+          main().catch(err => { console.error(err); process.exit(1); });
+          "
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="✅"
+            TEXT="Daily News Pipeline voltooid"
+          else
+            EMOJI="❌"
+            TEXT="Daily News Pipeline GEFAALD"
+          fi
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"${EMOJI} ${TEXT} — $(date +%Y-%m-%d)\"}" || true

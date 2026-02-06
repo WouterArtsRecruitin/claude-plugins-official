@@ -1,0 +1,335 @@
+name: Weekly Intelligence Pipeline
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'  # Maandag 08:00 CET (07:00 UTC)
+  workflow_dispatch:
+    inputs:
+      step:
+        description: 'Which step to run (all = full pipeline)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - market-trends
+          - icp-monitor
+          - concurrent-tracker
+          - job-board
+          - intent-signals
+          - email-engagement
+          - push-data
+          - dashboard
+          - report
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  intelligence-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout intelligence-hub
+        uses: actions/checkout@v4
+        with:
+          repository: WouterArtsRecruitin/intelligence-hub
+          token: ${{ secrets.GH_PAT }}
+          path: intelligence-hub
+
+      - name: Checkout content-intelligence-system
+        uses: actions/checkout@v4
+        with:
+          repository: WouterArtsRecruitin/recruitin-content-intelligence-system
+          token: ${{ secrets.GH_PAT }}
+          path: content-intelligence
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies (intelligence-hub)
+        run: cd intelligence-hub && npm ci
+
+      - name: Install Supabase client
+        run: npm install @supabase/supabase-js
+
+      # ============================================================
+      # STAP 1: Market Trends Scraper
+      # ============================================================
+      - name: "Step 1/7: Market Trends Scraper"
+        id: market_trends
+        if: inputs.step == 'all' || inputs.step == 'market-trends' || github.event_name == 'schedule'
+        env:
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        run: |
+          cd intelligence-hub
+          node scrapers/market-trends-scraper.js 2>&1 | tee ../market-trends.log
+          echo "status=done" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # STAP 2: ICP Monitor (wacht op market trends)
+      # ============================================================
+      - name: "Step 2/7: ICP Monitor"
+        id: icp_monitor
+        if: |
+          (inputs.step == 'all' || inputs.step == 'icp-monitor' || github.event_name == 'schedule') &&
+          (steps.market_trends.outcome == 'success' || steps.market_trends.outcome == 'skipped')
+        env:
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        run: |
+          cd intelligence-hub
+          node scrapers/icp-monitor.js 2>&1 | tee ../icp-monitor.log
+          echo "status=done" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # STAP 3: Concurrent Tracker (wacht op ICP)
+      # ============================================================
+      - name: "Step 3/7: Concurrent Tracker"
+        id: concurrent_tracker
+        if: |
+          (inputs.step == 'all' || inputs.step == 'concurrent-tracker' || github.event_name == 'schedule') &&
+          (steps.icp_monitor.outcome == 'success' || steps.icp_monitor.outcome == 'skipped')
+        env:
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        run: |
+          cd intelligence-hub
+          node scrapers/concurrent-tracker.js 2>&1 | tee ../concurrent-tracker.log
+          echo "status=done" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # STAP 4: Job Board Tracker
+      # ============================================================
+      - name: "Step 4/7: Job Board Tracker"
+        id: job_board
+        if: |
+          (inputs.step == 'all' || inputs.step == 'job-board' || github.event_name == 'schedule') &&
+          (steps.concurrent_tracker.outcome == 'success' || steps.concurrent_tracker.outcome == 'skipped')
+        run: |
+          cd intelligence-hub
+          if [ -f job-board-tracker.js ]; then
+            node job-board-tracker.js 2>&1 | tee ../job-board.log
+          else
+            echo "job-board-tracker.js not found, skipping"
+          fi
+          echo "status=done" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # STAP 5: Intent Signals + Email Engagement
+      # ============================================================
+      - name: "Step 5/7: Intent Signals & Email Engagement"
+        id: signals
+        if: |
+          (inputs.step == 'all' || inputs.step == 'intent-signals' || inputs.step == 'email-engagement' || github.event_name == 'schedule') &&
+          (steps.job_board.outcome == 'success' || steps.job_board.outcome == 'skipped')
+        run: |
+          cd intelligence-hub
+          if [ -f intent-signals-tracker.js ]; then
+            node intent-signals-tracker.js 2>&1 | tee ../intent-signals.log || echo "Intent signals failed, continuing"
+          fi
+          if [ -f email-engagement-tracker.js ]; then
+            node email-engagement-tracker.js 2>&1 | tee ../email-engagement.log || echo "Email engagement failed, continuing"
+          fi
+          echo "status=done" >> $GITHUB_OUTPUT
+
+      # ============================================================
+      # STAP 6: Push ALL Data to Supabase + Notion
+      # ============================================================
+      - name: "Step 6/7: Push to Supabase & Notion"
+        id: push_data
+        if: |
+          (inputs.step == 'all' || inputs.step == 'push-data' || github.event_name == 'schedule') &&
+          (steps.signals.outcome == 'success' || steps.signals.outcome == 'skipped')
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: '2e82252c-bb15-8168-b8f5-d67d66c69424'
+        run: |
+          node -e "
+          const { createClient } = require('@supabase/supabase-js');
+          const fs = require('fs');
+          const path = require('path');
+
+          const supabase = createClient(
+            process.env.SUPABASE_URL,
+            process.env.SUPABASE_SERVICE_ROLE_KEY
+          );
+
+          const week = Math.ceil((new Date() - new Date(new Date().getFullYear(), 0, 1)) / 604800000);
+          const year = new Date().getFullYear();
+
+          async function pushCSVtoSupabase(dir) {
+            const csvDir = path.join('intelligence-hub', dir);
+            if (!fs.existsSync(csvDir)) { console.log('No ' + dir + ' directory'); return 0; }
+
+            const files = fs.readdirSync(csvDir).filter(f => f.endsWith('.csv'));
+            let total = 0;
+
+            for (const file of files) {
+              const content = fs.readFileSync(path.join(csvDir, file), 'utf8');
+              const lines = content.split('\n').filter(l => l.trim());
+              if (lines.length < 2) continue;
+
+              const headers = lines[0].split(',').map(h => h.trim());
+              const rows = [];
+
+              for (let i = 1; i < lines.length; i++) {
+                const values = lines[i].split(',').map(v => v.trim());
+                const row = {};
+                headers.forEach((h, idx) => { row[h] = values[idx] || ''; });
+
+                rows.push({
+                  data_type: file.includes('market') ? 'market_trend'
+                    : file.includes('icp') ? 'icp_signal'
+                    : file.includes('concurrent') ? 'competitor_activity'
+                    : 'sector_news',
+                  keyword: row.keyword || row.company || row.competitor || file,
+                  region: row.region || row.location || '',
+                  source: row.source || 'intelligence-hub',
+                  metric_value: parseFloat(row.count || row.score || row.posts || 0),
+                  metric_label: row.metric || 'scraped_value',
+                  risk_level: row.risk || row.level || '',
+                  relevance_score: parseInt(row.relevance || 0),
+                  raw_data: row,
+                  week_number: week,
+                  year: year
+                });
+              }
+
+              if (rows.length > 0) {
+                const { error } = await supabase.from('market_intelligence').insert(rows);
+                if (error) console.error('Supabase error for ' + file + ':', error.message);
+                else { console.log(file + ': ' + rows.length + ' rows pushed'); total += rows.length; }
+              }
+            }
+            return total;
+          }
+
+          async function main() {
+            let total = 0;
+            total += await pushCSVtoSupabase('scraper-output');
+            total += await pushCSVtoSupabase('output');
+            console.log('Total rows pushed to Supabase: ' + total);
+
+            // Refresh materialized view
+            const { error } = await supabase.rpc('refresh_winning_strategies');
+            if (error) console.log('View refresh skipped (may not have enough data yet)');
+            else console.log('Winning strategies view refreshed');
+          }
+
+          main().catch(err => { console.error(err); process.exit(1); });
+          "
+
+          # Also push to Notion (legacy support)
+          cd intelligence-hub
+          if [ -f push-to-notion.js ]; then
+            NOTION_TOKEN=${{ secrets.NOTION_API_KEY }} \
+            NOTION_DATABASE_ID=2e82252c-bb15-8168-b8f5-d67d66c69424 \
+            node push-to-notion.js 2>&1 || echo "Notion push failed (non-critical)"
+          fi
+
+      # ============================================================
+      # STAP 7: Generate Dashboard & Report
+      # ============================================================
+      - name: "Step 7/7: Dashboard & Weekly Report"
+        id: dashboard
+        if: |
+          (inputs.step == 'all' || inputs.step == 'dashboard' || inputs.step == 'report' || github.event_name == 'schedule') &&
+          (steps.push_data.outcome == 'success' || steps.push_data.outcome == 'skipped')
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          cd intelligence-hub
+          if [ -f dashboard-generator.js ]; then
+            node dashboard-generator.js 2>&1 | tee ../dashboard.log || echo "Dashboard generation failed"
+          fi
+
+          # Generate Supabase-based summary
+          node -e "
+          const { createClient } = require('@supabase/supabase-js');
+          const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+          const week = Math.ceil((new Date() - new Date(new Date().getFullYear(), 0, 1)) / 604800000);
+          const year = new Date().getFullYear();
+
+          async function main() {
+            const { data: trends } = await supabase.from('market_intelligence')
+              .select('keyword, region, metric_value')
+              .eq('data_type', 'market_trend').eq('week_number', week).eq('year', year);
+
+            const { data: icp } = await supabase.from('market_intelligence')
+              .select('keyword, metric_value, relevance_score')
+              .eq('data_type', 'icp_signal').eq('week_number', week).eq('year', year);
+
+            const { data: competitors } = await supabase.from('market_intelligence')
+              .select('keyword, metric_value, risk_level')
+              .eq('data_type', 'competitor_activity').eq('week_number', week).eq('year', year);
+
+            console.log('=== WEEKLY INTELLIGENCE REPORT ===');
+            console.log('Week ' + week + ', ' + year);
+            console.log('');
+            console.log('Market Trends: ' + (trends?.length || 0) + ' data points');
+            console.log('ICP Signals: ' + (icp?.length || 0) + ' companies tracked');
+            console.log('Competitor Activity: ' + (competitors?.length || 0) + ' competitors');
+
+            if (trends?.length) {
+              console.log('');
+              console.log('Top vacature keywords:');
+              const sorted = trends.sort((a, b) => b.metric_value - a.metric_value);
+              sorted.slice(0, 5).forEach(t => console.log('  ' + t.keyword + ' (' + t.region + '): ' + t.metric_value));
+            }
+          }
+
+          main().catch(console.error);
+          " 2>&1 | tee ../weekly-report.log
+
+      # ============================================================
+      # Upload artifacts & Notify
+      # ============================================================
+      - name: Upload scraper artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intelligence-week-${{ github.run_number }}
+          path: |
+            intelligence-hub/scraper-output/
+            *.log
+          retention-days: 30
+
+      - name: Create summary
+        if: always()
+        run: |
+          echo "## Weekly Intelligence Pipeline — $(date +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Market Trends | ${{ steps.market_trends.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ICP Monitor | ${{ steps.icp_monitor.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Concurrent Tracker | ${{ steps.concurrent_tracker.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Job Board | ${{ steps.job_board.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Intent + Email | ${{ steps.signals.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Push to Supabase | ${{ steps.push_data.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dashboard | ${{ steps.dashboard.outcome }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            MSG="✅ Weekly Intelligence Pipeline voltooid — Week $(date +%V)"
+          else
+            MSG="❌ Weekly Intelligence Pipeline GEFAALD — Check GitHub Actions"
+          fi
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"text\": \"${MSG}\"}" || true
