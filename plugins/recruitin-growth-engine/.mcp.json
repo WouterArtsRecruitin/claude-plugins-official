@@ -3,6 +3,53 @@
     "supabase": {
       "type": "http",
       "url": "https://mcp.supabase.com/mcp"
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    },
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/"
+    },
+    "clay": {
+      "command": "npx",
+      "args": ["-y", "@clayhq/clay-mcp@latest"],
+      "env": {
+        "CLAY_API_KEY": "${CLAY_API_KEY}"
+      }
+    },
+    "slack": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-slack"],
+      "env": {
+        "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}",
+        "SLACK_TEAM_ID": "${SLACK_TEAM_ID}"
+      }
+    },
+    "pipedrive": {
+      "command": "npx",
+      "args": ["-y", "@iamsamuelfraga/mcp-pipedrive"],
+      "env": {
+        "PIPEDRIVE_API_TOKEN": "${PIPEDRIVE_API_TOKEN}",
+        "PIPEDRIVE_DOMAIN": "${PIPEDRIVE_DOMAIN}"
+      }
+    },
+    "linkedin": {
+      "command": "npx",
+      "args": ["-y", "@felipfr/linkedin-mcpserver"],
+      "env": {
+        "LINKEDIN_CLIENT_ID": "${LINKEDIN_CLIENT_ID}",
+        "LINKEDIN_CLIENT_SECRET": "${LINKEDIN_CLIENT_SECRET}",
+        "LINKEDIN_ACCESS_TOKEN": "${LINKEDIN_ACCESS_TOKEN}"
+      }
+    },
+    "ollama": {
+      "command": "npx",
+      "args": ["-y", "ollama-mcp"],
+      "env": {
+        "OLLAMA_HOST": "http://localhost:11434"
+      }
     }
   }
 }
